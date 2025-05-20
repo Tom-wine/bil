@@ -39,9 +39,11 @@ class Proxy:
 class ProxyManager:
     """Manages a pool of proxies."""
     
-    def __init__(self, proxy_file: Optional[str] = None):
+    def __init__(self, proxy_file: Optional[str] = None, rotation_strategy: str = "random"):
         """Initialize with proxies from a file."""
         self.proxies: List[Proxy] = []
+        self.rotation_strategy = rotation_strategy
+        self.current_proxy_index = 0
         
         if proxy_file:
             self.load_proxies(proxy_file)
@@ -105,6 +107,10 @@ class ProxyManager:
             session_id=session_id
         )
     
+    def count(self) -> int:
+        """Returns the number of proxies in the pool."""
+        return len(self.proxies)
+    
     def get_random_proxy(self) -> Optional[Proxy]:
         """Get a random proxy from the pool."""
         if not self.proxies:
@@ -122,3 +128,36 @@ class ProxyManager:
             return None
         
         return random.choice(country_proxies)
+    
+    def get_next_proxy(self, country_code: Optional[str] = None) -> Optional[Proxy]:
+        """Gets the next proxy based on the rotation strategy."""
+        if not self.proxies:
+            logger.warning("No proxies available")
+            return None
+            
+        if self.rotation_strategy == "random":
+            return self.get_random_proxy()
+        elif self.rotation_strategy == "round_robin":
+            return self._get_round_robin_proxy()
+        elif self.rotation_strategy == "country_match" and country_code:
+            # Try to get a proxy for the specific country, fall back to random
+            country_proxy = self.get_proxy_by_country(country_code)
+            if country_proxy:
+                return country_proxy
+            else:
+                return self.get_random_proxy()
+        else:
+            # Default to random
+            return self.get_random_proxy()
+    
+    def _get_round_robin_proxy(self) -> Optional[Proxy]:
+        """Get the next proxy in a round-robin fashion."""
+        if not self.proxies:
+            logger.warning("No proxies available")
+            return None
+            
+        # Get the next proxy in the rotation
+        proxy = self.proxies[self.current_proxy_index]
+        
+        # Update the index for next time
+        self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxies)

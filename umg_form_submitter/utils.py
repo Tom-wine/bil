@@ -5,7 +5,7 @@ import logging
 import datetime
 from typing import List, Dict, Any, Optional
 
-from models import Subscriber
+from models import Subscriber, SubmissionResult
 
 
 def setup_logging(log_file=None, debug=False):
@@ -109,12 +109,13 @@ def save_results_to_csv(results: List[Dict[str, Any]], output_path: Optional[str
     except Exception as e:
         logging.error(f"Error saving results to CSV: {str(e)}")
         raise
-def export_results(results, filename="submission_results.csv"):
+
+def export_results(results: List[SubmissionResult], filename="submission_results.csv"):
     """
     Export submission results to a CSV file.
     
     Args:
-        results: List of submission result dictionaries
+        results: List of submission result objects
         filename: Output CSV filename
     """
     import csv
@@ -130,14 +131,45 @@ def export_results(results, filename="submission_results.csv"):
     base, ext = os.path.splitext(filename)
     output_path = os.path.join(output_dir, f"{base}_{timestamp}{ext}")
     
-    # Write results to CSV
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        if not results or len(results) == 0:
-            return
+    # Convert SubmissionResult objects to dictionaries
+    result_dicts = []
+    for result in results:
+        result_dict = {
+            "email": result.subscriber.email,
+            "country": result.subscriber.country if hasattr(result.subscriber, "country") else "",
+            "success": result.success,
+            "error_message": result.error_message,
+            "attempts": result.attempts
+        }
+        
+        # Add additional fields if they exist
+        if hasattr(result, "status_code") and result.status_code is not None:
+            result_dict["status_code"] = result.status_code
+        
+        if hasattr(result, "response_text") and result.response_text is not None:
+            result_dict["response_text"] = result.response_text
             
-        fieldnames = results[0].keys()
+        if hasattr(result.subscriber, "postcode") and result.subscriber.postcode:
+            result_dict["postcode"] = result.subscriber.postcode
+            
+        if hasattr(result.subscriber, "first_name") and result.subscriber.first_name:
+            result_dict["first_name"] = result.subscriber.first_name
+            
+        if hasattr(result.subscriber, "last_name") and result.subscriber.last_name:
+            result_dict["last_name"] = result.subscriber.last_name
+        
+        result_dicts.append(result_dict)
+    
+    # Write results to CSV
+    if not result_dicts:
+        logging.warning("No results to export")
+        return
+        
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = result_dicts[0].keys()
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(results)
-        
+        writer.writerows(result_dicts)
+    
+    logging.info(f"Results exported to: {output_path}")    
     return output_path

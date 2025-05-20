@@ -7,14 +7,15 @@ from random import uniform
 from typing import Dict, List, Optional, Tuple
 import requests
 import urllib3
-import threading
 from collections import defaultdict
+import threading
 
 from config import (
     MAX_RETRIES, RETRY_DELAY_MIN, RETRY_DELAY_MAX, 
-    MIN_REQUEST_DELAY, MAX_REQUEST_DELAY
+    MIN_REQUEST_DELAY, MAX_REQUEST_DELAY,
+    CLIENT_ID, FORM_URL
 )
-from models import Subscriber, SubmissionPayload, SubmissionResult
+from models import Subscriber, SubmissionResult
 from proxies import Proxy, ProxyManager
 
 # Suppress insecure connection warnings
@@ -22,277 +23,290 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
-# Form URL endpoint
-FORM_ENDPOINT = "https://forms.umusic-online.com/api/v2/forms/-NL2jY3XB_QvQ4ttcCds/subscriptions"
+# Define a HeaderOrderKey class for compatibility
+class HeaderOrderKey:
+    pass
 
-# Specific headers that must be used for the request
-REQUIRED_HEADERS = {
-    "Host": "forms.umusic-online.com",
-    "Connection": "keep-alive",
-    "sec-ch-ua-platform": "\"Windows\"",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "sec-ch-ua": "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"",
-    "Content-Type": "application/json",
-    "sec-ch-ua-mobile": "?0",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Origin": "https://link.fans",
-    "Sec-Fetch-Site": "cross-site",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Dest": "empty",
-    "Referer": "https://link.fans/",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
+http = type('http', (), {'HeaderOrderKey': HeaderOrderKey})
+
+# Headers for OPTIONS request
+OPTIONS_HEADERS = {
+    "Host":        {"forms.umusic-online.com"},
+    "Connection":        {"keep-alive"},
+    "Accept":        {"*/*"},
+    "Access-Control-Request-Method":        {"POST"},
+    "Access-Control-Request-Headers":        {"access-control-allow-headers,content-type"},
+    "Origin":        {"https://link.fans"},
+    "User-Agent":        {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"},
+    "Sec-Fetch-Mode":        {"cors"},
+    "Sec-Fetch-Site":        {"cross-site"},
+    "Sec-Fetch-Dest":        {"empty"},
+    "Referer":        {"https://link.fans/"},
+    "Accept-Encoding":        {"gzip, deflate, br, zstd"},
+    "Accept-Language":        {"fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"},
+    http.HeaderOrderKey: { "Host", "Connection", "Accept", "Access-Control-Request-Method", "Access-Control-Request-Headers", "Origin", "User-Agent", "Sec-Fetch-Mode", "Sec-Fetch-Site", "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language" },
 }
 
-class FormSubmitter:
-    """Handles form submission to the UMG API."""
+# Headers for POST request
+POST_HEADERS = {
+    "Host":        {"forms.umusic-online.com"},
+    "Connection":        {"keep-alive"},
+    "sec-ch-ua-platform":        {"\"Windows\""},
+    "User-Agent":        {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"},
+    "Accept":        {"application/json, text/plain, */*"},
+    "sec-ch-ua":        {"\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\""},
+    "Content-Type":        {"application/json"},
+    "sec-ch-ua-mobile":        {"?0"},
+    "Access-Control-Allow-Headers":        {"Content-Type"},
+    "Origin":        {"https://link.fans"},
+    "Sec-Fetch-Site":        {"cross-site"},
+    "Sec-Fetch-Mode":        {"cors"},
+    "Sec-Fetch-Dest":        {"empty"},
+    "Referer":        {"https://link.fans/"},
+    "Accept-Encoding":        {"gzip, deflate, br, zstd"},
+    "Accept-Language":        {"fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"},
+    http.HeaderOrderKey: { "Host", "Connection", "sec-ch-ua-platform", "User-Agent", "Accept", "sec-ch-ua", "Content-Type", "sec-ch-ua-mobile", "Access-Control-Allow-Headers", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language" },
+}
+
+def convert_headers(headers_special_format):
+    """Convert headers from special format to requests-compatible format."""
+    # Extract only the actual headers, skipping the header order key
+    result = {}
+    for key, value in headers_special_format.items():
+        if key != http.HeaderOrderKey:
+            # Extract the string value from the set/dictionary
+            result[key] = next(iter(value))
+    return result
+
+class BatchSubmitter:
+    """Handles batch submission of forms."""
     
-    def __init__(self, proxy: Optional[Proxy] = None):
-        """Initialize FormSubmitter with optional proxy."""
-        self.proxy = proxy
-        self.session = None
-        self.results = []
-    
-    def initialize_session(self) -> requests.Session:
-        """Initialize or refresh the session with required headers."""
-        logger.info("Initializing new requests session...")
-        
-        if self.session:
-            self.session.close()
-        
-        self.session = requests.Session()
-        
-        # Set up retries
-        retry_strategy = Retry(
-            total=MAX_RETRIES,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-            backoff_factor=1
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-        
-        # Set default headers
-        self.session.headers.update(REQUIRED_HEADERS)
-        
-        # Configure proxy if provided
-        if self.proxy:
-            proxy_url = self.proxy.get_url()
-            self.session.proxies.update({
-                "http": proxy_url,
-                "https": proxy_url
-            })
-        
-        return self.session
-    
-    def close(self):
-        """Close the session."""
-        if self.session:
-            self.session.close()
-    
-    def _prepare_payload(self, subscriber: Subscriber) -> Dict:
-        """Prepare the form payload data."""
-        # Default country code since it's not in the Subscriber model
-        country_code = "US"  # Default to United States
-        
-        payload = {
-            "email": subscriber.email,
-            "name": subscriber.name if hasattr(subscriber, 'name') else "",
-            "locale": "en",
-            "country": country_code,  # Use default country code
-            "city": "",
-            "optInMessage": True,
-            "optInEmail": True,
-            "termsAndConditions": True,
-            "dateOfBirth": "",
-            "postalCode": ""
+    def __init__(self, proxy_manager: Optional[ProxyManager] = None, max_threads: int = 1):
+        """Initialize batch submitter."""
+        self.proxy_manager = proxy_manager
+        self.max_threads = max(1, max_threads)  # Ensure at least 1 thread
+        self.stats = {
+            "total": 0,
+            "success": 0,
+            "failure": 0,
+            "errors": defaultdict(int)
         }
-        return payload
+        self._stats_lock = threading.Lock()  # For thread safety
     
-    def submit(self, subscriber: Subscriber) -> SubmissionResult:
-        """Submit a single subscriber to the form."""
-        if not self.session:
-            self.initialize_session()
-        
-        success = False
-        error_message = ""
-        attempts = 0
-        retries_left = MAX_RETRIES
-        
-        # Prepare the payload
-        payload = self._prepare_payload(subscriber)
-        payload_json = json.dumps(payload)
-        
-        # Update Content-Length header for this request
-        headers = self.session.headers.copy()
-        headers["Content-Length"] = str(len(payload_json))
-        
-        while not success and retries_left > 0:
-            attempts += 1
-            try:
-                response = self.session.post(
-                    FORM_ENDPOINT,
-                    data=payload_json,
-                    headers=headers,
-                    timeout=30,
-                    verify=False
-                )
-                
-                if response.status_code == 200:
-                    success = True
-                    logger.info(f"Successfully submitted {subscriber.email}")
-                else:
-                    error_message = f"Failed submission: HTTP {response.status_code} - {response.text}"
-                    logger.error(error_message)
-                    
-                    # Add delay before retry
-                    delay = uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX)
-                    time.sleep(delay)
-                    retries_left -= 1
-                
-            except Exception as e:
-                error_message = f"Error during submission: {str(e)}"
-                logger.error(error_message)
-                
-                # Add delay before retry
-                delay = uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX)
-                time.sleep(delay)
-                retries_left -= 1
-        
-        # Add random delay between submissions to prevent rate limiting
-        time.sleep(uniform(MIN_REQUEST_DELAY, MAX_REQUEST_DELAY))
-        
-        result = SubmissionResult(
-            subscriber=subscriber,
-            success=success,
-            error_message=error_message,
-            attempts=attempts
-        )
-        self.results.append(result)
-        return result
-    
-    def submit_batch(self, subscribers: List[Subscriber], max_threads: int = 1) -> List[SubmissionResult]:
-        """Submit multiple subscribers."""
-        self.results = []
-        
-        if max_threads <= 1:
-            # Sequential processing
-            for idx, subscriber in enumerate(subscribers, 1):
-                logger.info(f"Processing {idx}/{len(subscribers)}: {subscriber.email}")
-                try:
-                    result = self.submit(subscriber)
-                    self.results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing {subscriber.email}: {str(e)}")
-                    result = SubmissionResult(
-                        subscriber=subscriber,
-                        success=False,
-                        error_message=str(e),
-                        attempts=1
-                    )
-                    self.results.append(result)
-        else:
-            # Parallel processing
-            self._parallel_submit(subscribers, max_threads)
-        
-        return self.results
-    
-    def _parallel_submit(self, subscribers: List[Subscriber], max_threads: int) -> List[SubmissionResult]:
-        """Submit subscribers in parallel."""
+    def submit_batch(self, subscribers: List[Subscriber]) -> List[SubmissionResult]:
+        """Submit a batch of forms."""
         results = []
-        thread_submitters = {}
-        thread_local = threading.local()
         
-        def get_thread_submitter():
-            thread_id = threading.get_ident()
-            if thread_id not in thread_submitters:
-                thread_submitters[thread_id] = FormSubmitter(proxy=self.proxy)
-                thread_submitters[thread_id].initialize_session()
-            return thread_submitters[thread_id]
-        
-        def process_subscriber(idx, subscriber):
-            logger.info(f"Processing {idx}/{len(subscribers)}: {subscriber.email}")
-            submitter = get_thread_submitter()
-            return submitter.submit(subscriber)
-        
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-                future_to_subscriber = {
-                    executor.submit(process_subscriber, idx, subscriber): (idx, subscriber)
-                    for idx, subscriber in enumerate(subscribers, 1)
-                }
+        # Use ThreadPoolExecutor for parallel submission if enabled
+        if self.max_threads > 1:
+            logger.info(f"Using thread pool with {self.max_threads} threads")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+                # Create list of tasks
+                futures = []
+                for subscriber in subscribers:
+                    # Get proxy if using proxies
+                    proxy = None
+                    if self.proxy_manager:
+                        proxy = self.proxy_manager.get_next_proxy(subscriber.country)
+                    
+                    # Submit task
+                    future = executor.submit(self.submit_form, subscriber, proxy)
+                    futures.append(future)
                 
-                for future in concurrent.futures.as_completed(future_to_subscriber):
-                    idx, subscriber = future_to_subscriber[future]
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(futures):
                     try:
                         result = future.result()
                         results.append(result)
+                        self._update_stats(result)
                     except Exception as e:
-                        logger.error(f"Error processing {subscriber.email}: {str(e)}")
-                        result = SubmissionResult(
-                            subscriber=subscriber,
-                            success=False,
-                            error_message=str(e),
-                            attempts=1
-                        )
-                        results.append(result)
-        
-        finally:
-            # Clean up all thread-local submitters
-            for thread_id, submitter in thread_submitters.items():
+                        logger.error(f"Error in worker thread: {str(e)}")
+        else:
+            # Single-threaded mode
+            for subscriber in subscribers:
+                # Get proxy if using proxies
+                proxy = None
+                if self.proxy_manager:
+                    proxy = self.proxy_manager.get_next_proxy(subscriber.country)
+                
+                # Submit form
                 try:
-                    submitter.close()
+                    result = self.submit_form(subscriber, proxy)
+                    results.append(result)
+                    self._update_stats(result)
                 except Exception as e:
-                    logger.warning(f"Error closing submitter for thread {thread_id}: {str(e)}")
+                    logger.error(f"Error submitting form: {str(e)}")
+                    # Create a result object for the error
+                    error_result = SubmissionResult(subscriber=subscriber, success=False)
+                    error_result.error = str(e)
+                    results.append(error_result)
+                    self._update_stats(error_result)
+                
+                # Add delay before next submission
+                if subscriber != subscribers[-1]:  # Don't delay after last submission
+                    delay = uniform(MIN_REQUEST_DELAY, MAX_REQUEST_DELAY)
+                    time.sleep(delay)
         
-        self.results.extend(results)
         return results
     
-    def get_statistics(self) -> Dict[str, int]:
-        """Get submission statistics."""
-        if not self.results:
-            return {"total": 0, "success": 0, "failure": 0}
+    def submit_form(self, subscriber: Subscriber, proxy: Optional[Proxy] = None) -> SubmissionResult:
+        """Submit a form with the given subscriber information."""
+        # Check if subscriber is None
+        if subscriber is None:
+            logger.error("Received None subscriber")
+            empty_subscriber = Subscriber(email="unknown", first_name="", last_name="", country="", postcode="")
+            result = SubmissionResult(subscriber=empty_subscriber, success=False)
+            result.error = "Subscriber is None"
+            return result
         
-        success_count = sum(1 for r in self.results if r.success)
-        total_count = len(self.results)
+        logger.info(f"Submitting form for {subscriber.email}")
         
-        return {
-            "total": total_count,
-            "success": success_count,
-            "failure": total_count - success_count
-        }
-
-class BatchSubmitter:
-    """Handles batch submission with optional proxy rotation."""
+        # Prepare result object
+        result = SubmissionResult(subscriber=subscriber, success=False)  # Initialize with success=False
+        
+        # Prepare proxy for requests
+        proxy_dict = None
+        if proxy:
+            proxy_dict = proxy.proxy_dict
+        
+        # Set up request session
+        session = requests.Session()
+        
+        # Convert headers to requests-compatible format
+        options_headers = convert_headers(OPTIONS_HEADERS)
+        post_headers = convert_headers(POST_HEADERS)
+        
+        # Add retry handling
+        for attempt in range(MAX_RETRIES):
+            try:
+                # First make OPTIONS request  
+                options_response = session.options(
+                    FORM_URL,
+                    headers=options_headers,  # Use converted headers
+                    proxies=proxy_dict,
+                    timeout=10,
+                    verify=False
+                )
+                
+                # Brief pause between OPTIONS and POST
+                time.sleep(uniform(0.5, 1.5))
+                
+                # Prepare payload (form data) with the exact structure provided
+                payload = {
+                    "client_id": CLIENT_ID,
+                    "optins": ["-MxcmJpUtUKsxARFLAz2"],
+                    "consumer": {
+                        "consumer_country": subscriber.country or "FR",
+                        "email": subscriber.email,
+                        "postcode": subscriber.postcode or ""
+                    },
+                    "metadata": {
+                        "acquisition_sys": "6d697261",
+                        "campaign_id": "ad41fa4adbff455fa967a6c62433566d",
+                        "host_url": "https://link.fans/hmhastoursignup"
+                    }
+                }
+                
+                # Debug the payload
+                logger.debug(f"Sending payload: {json.dumps(payload)}")
+                
+                # Make the POST request
+                response = session.post(
+                    FORM_URL,
+                    headers=post_headers,  # Use converted headers
+                    json=payload,  # This will properly serialize the dict to JSON
+                    proxies=proxy_dict,
+                    verify=False,
+                    timeout=30
+                )
+                
+                # Debug the response
+                logger.debug(f"Response status: {response.status_code}")
+                logger.debug(f"Response headers: {response.headers}")
+                logger.debug(f"Response body: {response.text}")
+                
+                # Process response
+                if response.status_code in (200, 201):
+                    # Success
+                    logger.info(f"Form submitted successfully for {subscriber.email}")
+                    result.success = True
+                    try:
+                        result.response_data = response.json()
+                    except:
+                        result.response_data = {"raw": response.text}
+                    return result
+                else:
+                    # Request failed with response
+                    logger.warning(f"Submission failed with status {response.status_code}: {response.text}")
+                    result.error = f"HTTP {response.status_code}: {response.text}"
+                    
+                    # If rate limited, definitely retry
+                    if response.status_code in (429, 503):
+                        delay = uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX) * (attempt + 1)
+                        logger.info(f"Rate limited. Retrying in {delay:.1f} seconds (attempt {attempt+1}/{MAX_RETRIES})")
+                        time.sleep(delay)
+                        continue
+                    
+                    # For client errors, don't retry
+                    if response.status_code >= 400 and response.status_code < 500:
+                        return result
+                    
+                    # For other errors, retry with backoff
+                    delay = uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX) * (attempt + 1)
+                    logger.info(f"Retrying in {delay:.1f} seconds (attempt {attempt+1}/{MAX_RETRIES})")
+                    time.sleep(delay)
+            
+            except Exception as e:
+                logger.error(f"Error submitting form for {subscriber.email}: {str(e)}")
+                result.error = str(e)
+                
+                # Retry with backoff
+                if attempt < MAX_RETRIES - 1:
+                    delay = uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX) * (attempt + 1)
+                    logger.info(f"Retrying in {delay:.1f} seconds (attempt {attempt+1}/{MAX_RETRIES})")
+                    time.sleep(delay)
+        
+        return result
     
-    def __init__(self, max_threads: int = 1, proxy_manager: Optional[ProxyManager] = None, headless: bool = True, **kwargs):
-        """Initialize BatchSubmitter with thread count and proxy configuration.
-        
-        Args:
-            max_threads: Maximum number of threads to use
-            proxy_manager: Optional proxy manager for rotation
-            headless: Ignored parameter (kept for compatibility)
-            **kwargs: Additional parameters (ignored)
-        """
-        self.max_threads = max_threads
-        self.proxy_manager = proxy_manager
-        self.submitter = None
+    def _update_stats(self, result: SubmissionResult) -> None:
+        """Update submission statistics (thread-safe)."""
+        with self._stats_lock:
+            self.stats["total"] += 1
+            
+            if result.success:
+                self.stats["success"] += 1
+            else:
+                self.stats["failure"] += 1
+                
+                # Track error types
+                error_type = "unknown"
+                if hasattr(result, 'error') and result.error:
+                    if "429" in result.error:
+                        error_type = "rate_limit"
+                    elif "403" in result.error:
+                        error_type = "forbidden"
+                    elif "timeout" in result.error.lower():
+                        error_type = "timeout"
+                    elif "connection" in result.error.lower():
+                        error_type = "connection"
+                    else:
+                        # Use first 30 chars of error as type
+                        error_type = result.error[:30]
+                
+                self.stats["errors"][error_type] += 1
     
-    def submit_batch(self, subscribers: List[Subscriber]) -> List[SubmissionResult]:
-        """Submit a batch of subscribers."""
-        proxy = None
-        if self.proxy_manager:
-            proxy = self.proxy_manager
-        
-        self.submitter = FormSubmitter(proxy=proxy)
-        return self.submitter.submit_batch(subscribers, max_threads=self.max_threads)
+    def get_stats(self) -> Dict:
+        """Get current submission statistics."""
+        with self._stats_lock:
+            return self.stats.copy()
     
-    def get_statistics(self) -> Dict[str, int]:
-        """Get submission statistics."""
-        if self.submitter and hasattr(self.submitter, 'get_statistics'):
-            return self.submitter.get_statistics()
+    def log_stats(self) -> None:
+        """Log current submission statistics."""
+        stats = self.get_stats()
         
-        # Default empty statistics if submitter not available
-        return {"total": 0, "success": 0, "failure": 0}
+        logger.info(f"Submission stats: {stats['success']}/{stats['total']} successful ({stats['failure']} failed)")
+        
+        if stats["errors"]:
+            logger.info("Error breakdown:")
+            for error_type, count in sorted(stats["errors"].items(), key=lambda x: x[1], reverse=True):
+                logger.info(f"  {error_type}: {count}")
